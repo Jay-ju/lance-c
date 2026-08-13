@@ -4266,6 +4266,50 @@ fn test_write_with_params_null_is_like_plain_write() {
 }
 
 #[test]
+fn test_write_preserves_auto_cleanup_default() {
+    // Lance 9.1 disabled auto-cleanup by default (auto_cleanup: None).
+    // lance-c exposes neither cleanup configuration nor an explicit cleanup
+    // operation, so the wrapper preserves the pre-9.1 default; datasets
+    // created through the C writer must keep their reclamation path.
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+    let c_uri = c_str(&uri);
+
+    let ffi_schema = schema_to_ffi(&write_schema());
+    let mut stream = batch_to_ffi_stream(write_batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0]));
+
+    let rc = unsafe {
+        lance_dataset_write_with_params(
+            c_uri.as_ptr(),
+            &ffi_schema,
+            &mut stream,
+            LanceWriteMode::Create as i32,
+            ptr::null(),
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+
+    let dataset = lance_c::runtime::block_on(lance::Dataset::open(&uri)).unwrap();
+    let config = &dataset.manifest.config;
+    assert_eq!(
+        config
+            .get("lance.auto_cleanup.interval")
+            .map(String::as_str),
+        Some("20"),
+        "auto-cleanup interval must be recorded in the manifest config"
+    );
+    assert_eq!(
+        config
+            .get("lance.auto_cleanup.older_than")
+            .map(String::as_str),
+        Some("14days"),
+        "auto-cleanup older_than must be recorded in the manifest config"
+    );
+}
+
+#[test]
 fn test_write_with_params_max_rows_per_file_splits_fragments() {
     let tmp = tempfile::tempdir().unwrap();
     let uri = tmp.path().join("ds").to_str().unwrap().to_string();
@@ -4635,10 +4679,8 @@ fn test_delete_invalid_predicate_rejected() {
     let pred = c_str("not a real predicate ((((");
     let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
     assert_eq!(rc, -1);
-    // Parser errors come back as Internal (this is what upstream surfaces;
-    // we don't try to re-classify them at the FFI boundary). If upstream
-    // ever tightens this to InvalidArgument, tighten this assertion too.
-    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    // Lance 9.1 classifies parser failures as invalid user input.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     // The dataset is left untouched on the error path.
     assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
 
@@ -4654,8 +4696,7 @@ fn test_delete_unknown_column_rejected() {
     let pred = c_str("no_such_column = 1");
     let rc = unsafe { lance_dataset_delete(ds, pred.as_ptr(), ptr::null_mut()) };
     assert_eq!(rc, -1);
-    // Same upstream classification as malformed SQL — see note above.
-    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
     assert_eq!(unsafe { lance_dataset_count_rows(ds) }, 3);
 
     unsafe { lance_dataset_close(ds) };
@@ -5106,9 +5147,9 @@ fn test_update_invalid_predicate_rejected() {
     let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
 
     // Garbage SQL — UpdateBuilder::update_where wraps parser errors as
-    // InvalidInput, so this surfaces as InvalidArgument (different from
-    // lance_dataset_delete, which routes through a different upstream path
-    // and surfaces these as Internal).
+    // InvalidInput, so this surfaces as InvalidArgument (lance_dataset_delete
+    // classifies parser failures the same way under Lance 9.1; see
+    // test_delete_invalid_predicate_rejected).
     let pred = c_str("not a real predicate ((((");
     let cols = [c_str("value")];
     let vals = [c_str("0.0")];
@@ -7932,13 +7973,8 @@ fn test_add_columns_sql_unknown_column_rejected() {
     let cols = [sql_column(&name, &expr)];
     let rc = unsafe { lance_dataset_add_columns_sql(ds, cols.as_ptr(), cols.len(), 0) };
     assert_eq!(rc, -1);
-    // A non-existent column is resolved by the lance-datafusion planner, which
-    // raises a schema error (`Error::Schema`) — the same upstream path as
-    // `lance_dataset_delete`'s unknown-column predicate. We don't re-classify
-    // it at the FFI boundary, so it surfaces as `Internal`, distinct from a
-    // *syntax* error, which the planner wraps as `InvalidInput`. If upstream
-    // ever tightens this to InvalidInput, tighten this assertion too.
-    assert_eq!(lance_last_error_code(), LanceErrorCode::Internal);
+    // Lance 9.1 classifies unknown expression columns as invalid user input.
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
 
     unsafe { lance_dataset_close(ds) };
 }
