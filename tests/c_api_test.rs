@@ -6,10 +6,11 @@
 //! These tests call the `extern "C"` functions directly from Rust,
 //! validating the C API contract without needing a C compiler.
 
-use std::ffi::{CString, c_char};
+use std::ffi::{CString, c_char, c_void};
 use std::process::Command;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
 use arrow::ffi::from_ffi;
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
@@ -97,6 +98,81 @@ fn create_large_dataset(num_rows: i32) -> (tempfile::TempDir, String) {
 
 fn c_str(s: &str) -> CString {
     CString::new(s).unwrap()
+}
+
+#[derive(Default)]
+struct CapturedScanStatistics {
+    calls: usize,
+    iops: u64,
+    requests: u64,
+    bytes_read: u64,
+    indices_loaded: u64,
+    index_partitions_loaded: u64,
+    index_comparisons: u64,
+    metrics: Vec<(String, LanceScanMetricKind, u64)>,
+}
+
+unsafe extern "C" fn capture_scan_statistics(
+    callback_ctx: *mut c_void,
+    statistics: *const LanceScanStatistics,
+) {
+    assert!(!callback_ctx.is_null());
+    assert!(!statistics.is_null());
+    let captured = unsafe { &mut *callback_ctx.cast::<CapturedScanStatistics>() };
+    let statistics = unsafe { &*statistics };
+    let metrics = if statistics.metrics_len == 0 {
+        &[]
+    } else {
+        assert!(!statistics.metrics.is_null());
+        unsafe { std::slice::from_raw_parts(statistics.metrics, statistics.metrics_len) }
+    };
+
+    captured.calls += 1;
+    captured.iops = statistics.iops;
+    captured.requests = statistics.requests;
+    captured.bytes_read = statistics.bytes_read;
+    captured.indices_loaded = statistics.indices_loaded;
+    captured.index_partitions_loaded = statistics.index_partitions_loaded;
+    captured.index_comparisons = statistics.index_comparisons;
+    captured.metrics = metrics
+        .iter()
+        .map(|metric| {
+            let name = if metric.name_len == 0 {
+                &[]
+            } else {
+                assert!(!metric.name.is_null());
+                unsafe { std::slice::from_raw_parts(metric.name.cast::<u8>(), metric.name_len) }
+            };
+            (
+                std::str::from_utf8(name).unwrap().to_owned(),
+                metric.kind,
+                metric.value,
+            )
+        })
+        .collect();
+}
+
+#[derive(Default)]
+struct AtomicScanStatisticsCapture {
+    calls: AtomicUsize,
+    invalid_statistics: AtomicBool,
+}
+
+unsafe extern "C" fn capture_scan_statistics_atomically(
+    callback_ctx: *mut c_void,
+    statistics: *const LanceScanStatistics,
+) {
+    if callback_ctx.is_null() {
+        return;
+    }
+    let captured = unsafe { &*callback_ctx.cast::<AtomicScanStatisticsCapture>() };
+    if statistics.is_null() {
+        captured
+            .invalid_statistics
+            .store(true, AtomicOrdering::SeqCst);
+        return;
+    }
+    captured.calls.fetch_add(1, AtomicOrdering::SeqCst);
 }
 
 /// Helper: build a tiny dataset whose `value` column is nullable AND contains
@@ -281,6 +357,366 @@ fn test_scanner_to_arrow_stream() {
     assert_eq!(total_rows, 5);
 
     unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_statistics_callback_with_next_multi_fragment() {
+    let (_tmp, uri) = create_multi_fragment_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    assert_eq!(unsafe { lance_dataset_fragment_count(ds) }, 2);
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    let mut captured = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+
+    loop {
+        let mut batch = ptr::null_mut();
+        match unsafe { lance_scanner_next(scanner, &mut batch) } {
+            0 => unsafe { lance_batch_free(batch) },
+            1 => break,
+            status => panic!("scanner_next returned error: {status}"),
+        }
+    }
+
+    assert_eq!(captured.calls, 1);
+    assert!(captured.bytes_read > 0);
+    assert!(captured.requests > 0);
+    assert!(captured.metrics.iter().all(|(name, _, _)| !name.is_empty()));
+
+    let mut batch = ptr::null_mut();
+    assert_eq!(unsafe { lance_scanner_next(scanner, &mut batch) }, 1);
+    assert!(batch.is_null());
+    assert_eq!(captured.calls, 1, "callback must run exactly once");
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_statistics_callback_not_called_on_early_scanner_close() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    let mut captured = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+
+    let mut batch = ptr::null_mut();
+    assert_eq!(unsafe { lance_scanner_next(scanner, &mut batch) }, 0);
+    assert!(!batch.is_null());
+    unsafe { lance_batch_free(batch) };
+
+    unsafe { lance_scanner_close(scanner) };
+    assert_eq!(captured.calls, 0);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_statistics_callback_applies_to_reused_scanner() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    let mut captured = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+
+    let mut first_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut first_stream) },
+        0
+    );
+    let first_reader = unsafe { ArrowArrayStreamReader::from_raw(&mut first_stream) }.unwrap();
+    assert_eq!(
+        first_reader
+            .map(|batch| batch.unwrap().num_rows())
+            .sum::<usize>(),
+        5
+    );
+    assert_eq!(captured.calls, 1);
+
+    let mut second_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut second_stream) },
+        0
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let second_reader = unsafe { ArrowArrayStreamReader::from_raw(&mut second_stream) }.unwrap();
+    assert_eq!(
+        second_reader
+            .map(|batch| batch.unwrap().num_rows())
+            .sum::<usize>(),
+        5
+    );
+    assert_eq!(captured.calls, 2);
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_statistics_callback_supports_concurrent_exported_streams() {
+    struct SendableArrowStream(FFI_ArrowArrayStream);
+    unsafe impl Send for SendableArrowStream {}
+
+    fn consume_stream(mut stream: SendableArrowStream) -> usize {
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream.0) }.unwrap();
+        reader.map(|batch| batch.unwrap().num_rows()).sum()
+    }
+
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    let captured = Arc::new(AtomicScanStatisticsCapture::default());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics_atomically),
+                Arc::as_ptr(&captured).cast_mut().cast(),
+            )
+        },
+        0
+    );
+
+    let mut first_stream = FFI_ArrowArrayStream::empty();
+    let mut second_stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut first_stream) },
+        0
+    );
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut second_stream) },
+        0
+    );
+    unsafe { lance_scanner_close(scanner) };
+
+    let first = std::thread::spawn(move || consume_stream(SendableArrowStream(first_stream)));
+    let second = std::thread::spawn(move || consume_stream(SendableArrowStream(second_stream)));
+    assert_eq!(first.join().unwrap(), 5);
+    assert_eq!(second.join().unwrap(), 5);
+    assert_eq!(captured.calls.load(AtomicOrdering::SeqCst), 2);
+    assert!(!captured.invalid_statistics.load(AtomicOrdering::SeqCst));
+
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_statistics_callback_not_called_on_early_arrow_stream_release() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+    let mut captured = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    let mut reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    assert!(reader.next().unwrap().is_ok());
+    drop(reader);
+
+    assert_eq!(captured.calls, 0);
+    unsafe { lance_scanner_close(scanner) };
+    assert_eq!(captured.calls, 0);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_statistics_callback_not_called_on_materialization_error() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+
+    let bad_filter = c_str("NOT A VALID >>> FILTER ???");
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), bad_filter.as_ptr()) };
+    assert!(!scanner.is_null());
+    let mut captured = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+
+    let mut batch = ptr::null_mut();
+    assert_eq!(unsafe { lance_scanner_next(scanner, &mut batch) }, -1);
+    assert!(batch.is_null());
+    assert_eq!(captured.calls, 0);
+
+    unsafe { lance_scanner_close(scanner) };
+    assert_eq!(captured.calls, 0);
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_statistics_callback_rejects_null_inputs() {
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                ptr::null_mut(),
+                Some(capture_scan_statistics),
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert_eq!(
+        unsafe { lance_scanner_set_statistics_callback(scanner, None, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_statistics_callback_replaces_registration_before_scan() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    let mut replaced = CapturedScanStatistics::default();
+    let mut active = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut replaced as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut active as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        0
+    );
+
+    let mut stream = FFI_ArrowArrayStream::empty();
+    assert_eq!(
+        unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+        0
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+    assert_eq!(
+        reader.map(|batch| batch.unwrap().num_rows()).sum::<usize>(),
+        5
+    );
+    assert_eq!(replaced.calls, 0);
+    assert_eq!(active.calls, 1);
+
+    unsafe { lance_scanner_close(scanner) };
+    unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_scanner_statistics_callback_rejects_registration_after_scan_started() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!ds.is_null());
+    let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
+    assert!(!scanner.is_null());
+
+    let mut batch = ptr::null_mut();
+    assert_eq!(unsafe { lance_scanner_next(scanner, &mut batch) }, 0);
+    assert!(!batch.is_null());
+    unsafe { lance_batch_free(batch) };
+
+    let mut captured = CapturedScanStatistics::default();
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics),
+                (&mut captured as *mut CapturedScanStatistics).cast(),
+            )
+        },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    let error = take_last_error_message();
+    assert!(error.contains("before the scan starts"), "{error}");
+
+    unsafe { lance_scanner_close(scanner) };
+    assert_eq!(captured.calls, 0);
     unsafe { lance_dataset_close(ds) };
 }
 
@@ -518,6 +954,17 @@ fn test_scanner_scan_async() {
 
     let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
     assert!(!scanner.is_null());
+    let captured = Arc::new(AtomicScanStatisticsCapture::default());
+    assert_eq!(
+        unsafe {
+            lance_scanner_set_statistics_callback(
+                scanner,
+                Some(capture_scan_statistics_atomically),
+                Arc::as_ptr(&captured).cast_mut().cast(),
+            )
+        },
+        0
+    );
 
     // Synchronization primitive for the async callback.
     struct CallbackResult {
@@ -549,6 +996,7 @@ fn test_scanner_scan_async() {
             on_complete,
             Arc::as_ptr(&pair_clone) as *mut std::ffi::c_void,
         );
+        lance_scanner_close(scanner);
     }
 
     // Wait for callback.
@@ -565,8 +1013,9 @@ fn test_scanner_scan_async() {
     let reader = unsafe { ArrowArrayStreamReader::from_raw(ffi_stream) }.unwrap();
     let total_rows: usize = reader.map(|r| r.unwrap().num_rows()).sum();
     assert_eq!(total_rows, 5);
+    assert_eq!(captured.calls.load(AtomicOrdering::SeqCst), 1);
+    assert!(!captured.invalid_statistics.load(AtomicOrdering::SeqCst));
 
-    unsafe { lance_scanner_close(scanner) };
     unsafe { lance_dataset_close(ds) };
 }
 
@@ -1181,7 +1630,6 @@ fn test_poll_next_basic() {
         let c_uri = c_str(&uri_clone);
         let ds = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
         let scanner = unsafe { lance_scanner_new(ds, ptr::null(), ptr::null()) };
-
         use std::sync::atomic::{AtomicBool, Ordering};
         static WOKE: AtomicBool = AtomicBool::new(false);
         unsafe extern "C" fn test_waker(_ctx: *mut std::ffi::c_void) {
