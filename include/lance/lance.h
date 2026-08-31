@@ -185,6 +185,7 @@ typedef struct LanceVersions LanceVersions;
 typedef struct LanceDataStatistics LanceDataStatistics;
 typedef struct LanceIndexSegmentBuilder LanceIndexSegmentBuilder;
 typedef struct LanceIndexSegmentMetadata LanceIndexSegmentMetadata;
+typedef struct LanceFtsQueryContext LanceFtsQueryContext;
 
 /* ─── Dataset lifecycle ─── */
 
@@ -1603,6 +1604,56 @@ int32_t lance_scanner_set_index_segments(
 /* ─── Full-text search (Phase 2) ─── */
 
 /**
+ * Required relationship between a pinned dataset snapshot and its committed
+ * FTS index segments. Values are ABI-stable; API parameters use int32_t.
+ */
+typedef enum {
+    /** Fail prepare if any current fragment is not covered by the FTS index. */
+    LANCE_FTS_COVERAGE_STRICT = 0,
+    /** Score and search only rows covered by committed FTS index segments. */
+    LANCE_FTS_COVERAGE_INDEX_ONLY = 1,
+} LanceFtsCoverageMode;
+
+/**
+ * Prepare an immutable, process-local FTS query context for one column.
+ *
+ * Preparation pins the dataset handle's current snapshot, enumerates all
+ * committed FTS segments for `column`, checks fragment coverage, opens those
+ * segments, and computes one query-specific global BM25 scorer across their
+ * indexed documents. The context can then be shared by any number of scanners
+ * created from the exact same process-local dataset snapshot. It has no
+ * serialization or cross-process transport format. Reopening the same URI and
+ * manifest version creates a different identity and cannot reuse the context,
+ * because storage options and object-store endpoints may differ.
+ *
+ * In LANCE_FTS_COVERAGE_INDEX_ONLY mode, unindexed fragments are allowed and
+ * excluded from both the scorer corpus and query results. In STRICT mode any
+ * unindexed fragment makes this call fail.
+ *
+ * Prepared contexts currently support exact Match queries only.
+ * `max_fuzzy_distance` must be zero because fuzzy execution requires its
+ * canonical expanded vocabulary to be prepared together with the scorer.
+ * This restriction does not apply to lance_scanner_full_text_search().
+ *
+ * @param max_fuzzy_distance Must be zero for prepared query contexts.
+ * @param coverage_mode Fixed-width LanceFtsCoverageMode discriminant.
+ * @return Context handle on success, or NULL on error.
+ */
+LanceFtsQueryContext* lance_dataset_prepare_fts_query(
+    const LanceDataset* dataset,
+    const char* column,
+    const char* query,
+    uint32_t max_fuzzy_distance,
+    int32_t coverage_mode
+);
+
+/**
+ * Close a context handle. NULL-safe. Scanners that already attached this
+ * context retain shared ownership and remain valid.
+ */
+void lance_fts_query_context_close(LanceFtsQueryContext* context);
+
+/**
  * Set a BM25 full-text search query on the scanner.
  *
  * Mutually exclusive with lance_scanner_nearest: calling either after the
@@ -1619,6 +1670,30 @@ int32_t lance_scanner_full_text_search(
     const char* query,
     const char* const* columns,
     uint32_t max_fuzzy_distance
+);
+
+/**
+ * Attach a prepared process-local FTS query context. The scanner must have
+ * been created from the exact LanceDataset snapshot used to prepare the
+ * context; URI and manifest version equality is not sufficient. The scanner
+ * retains shared ownership, so the caller may close `context` after success.
+ * This is mutually exclusive with nearest and lance_scanner_full_text_search
+ * because the context already owns the FTS query.
+ */
+int32_t lance_scanner_set_fts_query_context(
+    LanceScanner* scanner,
+    const LanceFtsQueryContext* context
+);
+
+/**
+ * Restrict a context-backed FTS scan to `len` context segment UUIDs supplied
+ * by the caller's planner. Pass `len == 0` to clear the restriction and search
+ * all context segments. Duplicate or unknown UUIDs are rejected.
+ */
+int32_t lance_scanner_set_fts_index_segments(
+    LanceScanner* scanner,
+    const uint8_t* segment_uuids,
+    size_t len
 );
 
 /* ─── Dataset writer ─── */
